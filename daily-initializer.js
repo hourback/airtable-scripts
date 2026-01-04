@@ -1,45 +1,81 @@
-// TABLE NAMES
+// 1. Setup - Select the target date
+let targetDate = new Date();
+const dateChoice = await input.buttonsAsync('Which day are we staging?', ['Today', 'Other Date']);
+
+if (dateChoice === 'Other Date') {
+    let customDateStr = await input.textAsync('Enter date (YYYY-MM-DD):');
+    targetDate = new Date(customDateStr);
+}
+
+targetDate.setHours(0, 0, 0, 0);
+const dateString = targetDate.toISOString().split('T')[0];
+
+// 2. Load Tables
 const habitsTable = base.getTable('Habits');
 const trackingTable = base.getTable('Habit Tracking');
 const daysTable = base.getTable('Days');
 
-const todayStr = new Date().toISOString().split('T')[0];
+// 3. Find or Create the "Day" record
+let daysQuery = await daysTable.selectRecordsAsync({fields: ['Date']});
+let dayRecord = daysQuery.records.find(r => r.getCellValue('Date') === dateString);
 
-// 1. Ensure the "Day Bucket" exists
-const daysQuery = await daysTable.selectRecordsAsync({fields: ['Date']});
-let dayRecord = daysQuery.records.find(r => r.getCellValue('Date') === todayStr);
-let dayRecordId = dayRecord ? dayRecord.id : await daysTable.createRecordAsync({'Date': todayStr});
-
-// 2. Fetch Habits that are BOTH Active AND Due Today
-const habitQuery = await habitsTable.selectRecordsAsync({
-    fields: ['Habit Name', 'Active?', 'Due Today?']
-});
-
-// We only want habits where Active is true AND Due Today? is 1 (or true)
-const habitsToInitialize = habitQuery.records.filter(r => {
-    return r.getCellValue('Active?') === true && r.getCellValue('Due Today?') === 1;
-});
-
-// 3. Prevent Duplicates
-const trackingQuery = await trackingTable.selectRecordsAsync({fields: ['Day Bucket', 'Habit']});
-const existingHabitIds = trackingQuery.records
-    .filter(r => r.getCellValue('Day Bucket')?.[0]?.id === dayRecordId)
-    .map(l => l.getCellValue('Habit')?.[0]?.id);
-
-let recordsToCreate = habitsToInitialize
-    .filter(h => !existingHabitIds.includes(h.id))
-    .map(h => ({
-        fields: {
-            'Habit': [{id: h.id}],
-            'Day Bucket': [{id: dayRecordId}],
-            'Actual Value': 0
-        }
-    }));
-
-// 4. Create Records
-if (recordsToCreate.length > 0) {
-    await trackingTable.createRecordsAsync(recordsToCreate);
-    output.text(`✅ Initialized ${recordsToCreate.length} habits based on your cadence!`);
+if (!dayRecord) {
+    output.text(`Creating new day record for ${dateString}...`);
+    dayRecord = await daysTable.createRecordAsync({'Date': dateString});
 } else {
-    output.text("ℹ️ No new habits due today or already initialized.");
+    dayRecord = dayRecord.id;
+}
+
+// 4. Safety Check: Find what's ALREADY staged for this day
+const existingTrackingQuery = await trackingTable.selectRecordsAsync({fields: ['Habit', 'Day Bucket']});
+const alreadyStagedHabitIds = existingTrackingQuery.records
+    .filter(r => {
+        let dayLink = r.getCellValue('Day Bucket');
+        return dayLink && dayLink[0].id === dayRecord;
+    })
+    .map(r => r.getCellValue('Habit')[0].id);
+
+// 5. Logic: Which habits SHOULD be there?
+const habitRecords = await habitsTable.selectRecordsAsync({
+    fields: ['Habit Name', 'Weight', 'Target Value', 'Frequency (Days)', 'Last Completed Date', 'Active?']
+});
+
+let newSlips = [];
+
+for (let record of habitRecords.records) {
+    if (!record.getCellValue('Active?')) continue;
+    
+    // IDEMPOTENCY CHECK: Skip if this habit is already in the tracking table for this day
+    if (alreadyStagedHabitIds.includes(record.id)) continue;
+
+    let frequency = record.getCellValue('Frequency (Days)') || 1;
+    let lastDone = record.getCellValue('Last Completed Date');
+    let shouldCreate = false;
+
+    if (!lastDone) {
+        shouldCreate = true;
+    } else {
+        let lastDoneDate = new Date(lastDone);
+        lastDoneDate.setHours(0, 0, 0, 0);
+        let diffInDays = Math.floor((targetDate.getTime() - lastDoneDate.getTime()) / (1000 * 3600 * 24));
+        if (diffInDays >= frequency) shouldCreate = true;
+    }
+
+    if (shouldCreate) {
+        newSlips.push({
+            fields: {
+                'Habit': [{id: record.id}],
+                'Day Bucket': [{id: dayRecord}],
+                'Actual Value': 0 // Initializing at zero
+            }
+        });
+    }
+}
+
+// 6. Execution
+if (newSlips.length > 0) {
+    await trackingTable.createRecordsAsync(newSlips);
+    output.text(`✅ Successfully staged ${newSlips.length} new habit slips for ${dateString}.`);
+} else {
+    output.text(`ℹ️ No new habits needed for ${dateString}. (Everything is either not due or already staged!)`);
 }
